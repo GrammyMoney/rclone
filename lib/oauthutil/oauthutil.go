@@ -612,6 +612,7 @@ type Options struct {
 	NoOffline    bool                    // If set then "access_type=offline" parameter is not passed
 	CheckAuth    CheckAuthFn             // When the AuthResult is known the checkAuth function is called if set
 	OAuth2Opts   []oauth2.AuthCodeOption // extra oauth2 options
+	PKCE         bool                    // If set, use PKCE (RFC 7636) with the S256 method for the authorization code flow
 }
 
 // ConfigOut returns a config item suitable for the backend config
@@ -695,8 +696,11 @@ func ConfigOAuth(ctx context.Context, name string, m configmap.Mapper, ri *fs.Re
 		if err != nil {
 			return nil, err
 		}
-		if noWebserverNeeded(opt.OAuth2Config) {
-			authURL, _, err := getAuthURL(name, m, opt.OAuth2Config, opt)
+		// The PKCE verifier can't survive between config states, so
+		// with PKCE use "rclone authorize" which does the whole flow
+		// in one process.
+		if noWebserverNeeded(opt.OAuth2Config) && !opt.PKCE {
+			authURL, _, err := getAuthURL(name, m, opt.OAuth2Config, opt, "")
 			if err != nil {
 				return nil, err
 			}
@@ -790,14 +794,21 @@ version recommended):
 				return nil, err
 			}
 		} else {
+			var verifier string
+			if opt.PKCE {
+				if code != "" {
+					return nil, errors.New("can't use a pasted verification code with PKCE - use \"rclone authorize\" instead")
+				}
+				verifier = oauth2.GenerateVerifier()
+			}
 			if code == "" {
 				oauthConfig = fixRedirect(oauthConfig)
-				code, err = configSetup(ctx, ri.Name, name, m, oauthConfig, opt)
+				code, err = configSetup(ctx, ri.Name, name, m, oauthConfig, opt, verifier)
 				if err != nil {
 					return nil, fmt.Errorf("config failed to refresh token: %w", err)
 				}
 			}
-			err = configExchange(ctx, name, m, oauthConfig, code)
+			err = configExchange(ctx, name, m, oauthConfig, code, verifier)
 			if err != nil {
 				return nil, err
 			}
@@ -882,7 +893,9 @@ func noWebserverNeeded(oauthConfig *Config) bool {
 }
 
 // get the URL we need to send the user to
-func getAuthURL(name string, m configmap.Mapper, oauthConfig *Config, opt *Options) (authURL string, state string, err error) {
+//
+// If verifier is set then the PKCE S256 code challenge is added.
+func getAuthURL(name string, m configmap.Mapper, oauthConfig *Config, opt *Options, verifier string) (authURL string, state string, err error) {
 	oauthConfig, _ = OverrideCredentials(name, m, oauthConfig)
 
 	// Make random state
@@ -898,6 +911,9 @@ func getAuthURL(name string, m configmap.Mapper, oauthConfig *Config, opt *Optio
 	opts := opt.OAuth2Opts
 	if !opt.NoOffline {
 		opts = append(opts, oauth2.AccessTypeOffline)
+	}
+	if verifier != "" {
+		opts = append(opts, oauth2.S256ChallengeOption(verifier))
 	}
 	authURL = oauth2Conf.AuthCodeURL(state, opts...)
 	return authURL, state, nil
@@ -941,15 +957,18 @@ func clientCredentialsFlowGetToken(ctx context.Context, name string, m configmap
 //
 // If opt is nil it will use the default Options.
 //
+// If verifier is set then PKCE is used and the same verifier must be
+// passed to configExchange.
+//
 // It will run an internal webserver to receive the results
-func configSetup(ctx context.Context, id, name string, m configmap.Mapper, oauthConfig *Config, opt *Options) (string, error) {
+func configSetup(ctx context.Context, id, name string, m configmap.Mapper, oauthConfig *Config, opt *Options, verifier string) (string, error) {
 	if opt == nil {
 		opt = &Options{}
 	}
 	authorizeNoAutoBrowserValue, ok := m.Get(config.ConfigAuthNoBrowser)
 	authorizeNoAutoBrowser := ok && authorizeNoAutoBrowserValue != ""
 
-	authURL, state, err := getAuthURL(name, m, oauthConfig, opt)
+	authURL, state, err := getAuthURL(name, m, oauthConfig, opt, verifier)
 	if err != nil {
 		return "", err
 	}
@@ -1013,13 +1032,19 @@ func configSetup(ctx context.Context, id, name string, m configmap.Mapper, oauth
 }
 
 // Exchange the code for a token
-func configExchange(ctx context.Context, name string, m configmap.Mapper, oauthConfig *Config, code string) error {
+//
+// If verifier is set then it is sent as the PKCE code verifier.
+func configExchange(ctx context.Context, name string, m configmap.Mapper, oauthConfig *Config, code string, verifier string) error {
 	ctx = Context(ctx, fshttp.NewClient(ctx))
 
 	// Create the configuration required for the OAuth flow
 	oauth2Conf := oauthConfig.MakeOauth2Config()
 
-	token, err := oauth2Conf.Exchange(ctx, code)
+	var opts []oauth2.AuthCodeOption
+	if verifier != "" {
+		opts = append(opts, oauth2.VerifierOption(verifier))
+	}
+	token, err := oauth2Conf.Exchange(ctx, code, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to get token: %w", err)
 	}
